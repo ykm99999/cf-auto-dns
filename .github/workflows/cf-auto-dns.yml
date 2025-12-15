@@ -1,32 +1,78 @@
-CF_IPS=(
-  104.16.0.0
-  104.17.0.0
-  104.18.0.0
-  104.19.0.0
-  104.20.0.0
-  104.21.0.0
-  172.67.0.0
-  162.159.0.0
-)
+name: Cloudflare Auto Best IP
 
-BEST_IP=""
-BEST_TIME=999999
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 每 6 小时自动运行
+  workflow_dispatch:        # 允许手动触发
 
-echo "开始 Cloudflare 优选 IP（HTTPS 测速）..."
+jobs:
+  update-dns:
+    runs-on: ubuntu-latest
 
-for ip in "${CF_IPS[@]}"; do
-    TIME=$(curl -o /dev/null -s -w "%{time_connect}" --connect-timeout 2 https://$ip 2>/dev/null)
-    if [[ $? -eq 0 ]]; then
-        echo "IP: $ip 连接时间: $TIME 秒"
-        COMP=$(echo "$TIME < $BEST_TIME" | bc)
-        if [[ $COMP -eq 1 ]]; then
-            BEST_TIME=$TIME
-            BEST_IP=$ip
-        fi
-    else
-        echo "IP: $ip 不可连接"
-    fi
-done
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-echo "最佳 IP: $BEST_IP"
-echo "BEST_IP=$BEST_IP" >> $GITHUB_ENV
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq bc curl
+
+      - name: Generate best Cloudflare IP
+        run: |
+          CF_IPS=(
+            104.16.0.0
+            104.17.0.0
+            104.18.0.0
+            104.19.0.0
+            104.20.0.0
+            104.21.0.0
+            172.67.0.0
+            162.159.0.0
+          )
+
+          BEST_IP=""
+          BEST_TIME=999999
+
+          echo "开始 Cloudflare 优选 IP（HTTPS 测速）..."
+
+          for ip in "${CF_IPS[@]}"; do
+              TIME=$(curl -o /dev/null -s -w "%{time_connect}" --connect-timeout 2 https://$ip || echo "")
+              if [[ -n "$TIME" ]]; then
+                  echo "IP: $ip 连接时间: $TIME 秒"
+                  COMP=$(echo "$TIME < $BEST_TIME" | bc)
+                  if [[ $COMP -eq 1 ]]; then
+                      BEST_TIME=$TIME
+                      BEST_IP=$ip
+                  fi
+              else
+                  echo "IP: $ip 不可连接"
+              fi
+          done
+
+          echo "最佳 IP: $BEST_IP"
+          echo "BEST_IP=$BEST_IP" >> $GITHUB_ENV
+
+      - name: Update Cloudflare DNS
+        run: |
+          echo "准备将 DNS 更新为: $BEST_IP"
+
+          if [[ -z "$BEST_IP" ]]; then
+            echo "未找到可用 IP，退出。"
+            exit 1
+          fi
+
+          RECORD_ID=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records?type=A&name=${{ secrets.DOMAIN }}" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+          echo "找到 DNS 记录 ID: $RECORD_ID"
+
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records/$RECORD_ID" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"${{ secrets.DOMAIN }}\",\"content\":\"$BEST_IP\",\"ttl\":120,\"proxied\":false}"
+
+          echo "DNS 已更新为 $BEST_IP"
