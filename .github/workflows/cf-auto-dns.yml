@@ -9,6 +9,9 @@ jobs:
   update-dns:
     runs-on: ubuntu-latest
 
+    env:
+      PROXIED: "false"   # "true"=橙云走CDN, "false"=灰云直连
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,59 +23,126 @@ jobs:
 
       - name: Generate best Cloudflare IP
         run: |
+          # 这里放一批 Cloudflare 节点 IP，随时可以扩
           CF_IPS=(
             104.16.0.0
+            104.16.1.0
+            104.16.2.0
+            104.16.3.0
+            104.16.4.0
             104.17.0.0
+            104.17.1.0
+            104.17.2.0
             104.18.0.0
+            104.18.1.0
+            104.18.2.0
             104.19.0.0
+            104.19.1.0
+            104.19.2.0
             104.20.0.0
+            104.20.1.0
+            104.20.2.0
             104.21.0.0
+            104.21.1.0
+            104.21.2.0
             172.67.0.0
+            172.67.1.0
+            172.67.2.0
             162.159.0.0
+            162.159.1.0
+            162.159.2.0
           )
 
           BEST_IP=""
           BEST_TIME=999999
+          LOG_FILE="cf_probe_$(date -u +%Y%m%dT%H%M%S).log"
 
           echo "开始 Cloudflare 优选 IP（HTTPS 测速）..."
+          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" | tee -a "$LOG_FILE"
+          echo "Testing IPs..." | tee -a "$LOG_FILE"
 
           for ip in "${CF_IPS[@]}"; do
               TIME=$(curl -o /dev/null -s -w "%{time_connect}" --connect-timeout 2 https://$ip || echo "")
               if [[ -n "$TIME" ]]; then
-                  echo "IP: $ip 连接时间: $TIME 秒"
+                  echo "IP: $ip 连接时间: $TIME 秒" | tee -a "$LOG_FILE"
                   COMP=$(echo "$TIME < $BEST_TIME" | bc)
                   if [[ $COMP -eq 1 ]]; then
                       BEST_TIME=$TIME
                       BEST_IP=$ip
                   fi
               else
-                  echo "IP: $ip 不可连接"
+                  echo "IP: $ip 不可连接" | tee -a "$LOG_FILE"
               fi
           done
 
-          echo "最佳 IP: $BEST_IP"
-          echo "BEST_IP=$BEST_IP" >> $GITHUB_ENV
-
-      - name: Update Cloudflare DNS
-        run: |
-          echo "准备将 DNS 更新为: $BEST_IP"
+          echo "最佳 IP: $BEST_IP (time_connect=$BEST_TIME)" | tee -a "$LOG_FILE"
 
           if [[ -z "$BEST_IP" ]]; then
-            echo "未找到可用 IP，退出。"
+            echo "没有找到可用 IP，直接失败退出。"
             exit 1
           fi
 
-          RECORD_ID=$(curl -s -X GET \
+          echo "BEST_IP=$BEST_IP" >> $GITHUB_ENV
+          echo "LOG_FILE=$LOG_FILE" >> $GITHUB_ENV
+
+      - name: Fetch current DNS record
+        id: fetch_dns
+        run: |
+          echo "读取当前 DNS 记录..."
+          RESP=$(curl -s -X GET \
             "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records?type=A&name=${{ secrets.DOMAIN }}" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
-            -H "Content-Type: application/json" | jq -r '.result[0].id')
+            -H "Content-Type: application/json")
 
-          echo "找到 DNS 记录 ID: $RECORD_ID"
+          echo "$RESP" | jq '.'
+
+          RECORD_ID=$(echo "$RESP" | jq -r '.result[0].id')
+          OLD_IP=$(echo "$RESP" | jq -r '.result[0].content')
+          OLD_PROXIED=$(echo "$RESP" | jq -r '.result[0].proxied')
+
+          echo "RECORD_ID=$RECORD_ID" >> $GITHUB_ENV
+          echo "OLD_IP=$OLD_IP" >> $GITHUB_ENV
+          echo "OLD_PROXIED=$OLD_PROXIED" >> $GITHUB_ENV
+
+          echo "当前 DNS IP: $OLD_IP"
+          echo "当前 proxied 状态: $OLD_PROXIED"
+
+      - name: Update Cloudflare DNS to best IP
+        run: |
+          echo "准备将 DNS 从 $OLD_IP 更新为: $BEST_IP"
 
           curl -s -X PUT \
             "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records/$RECORD_ID" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"${{ secrets.DOMAIN }}\",\"content\":\"$BEST_IP\",\"ttl\":120,\"proxied\":false}"
+            --data "{\"type\":\"A\",\"name\":\"${{ secrets.DOMAIN }}\",\"content\":\"$BEST_IP\",\"ttl\":120,\"proxied\":${PROXIED}}"
 
-          echo "DNS 已更新为 $BEST_IP"
+          echo "DNS 已更新为 $BEST_IP, proxied=${PROXIED}"
+
+      - name: Verify new IP, rollback if failed
+        run: |
+          echo "验证新 IP 是否可用: $BEST_IP"
+
+          TIME=$(curl -o /dev/null -s -w "%{time_connect}" --connect-timeout 3 https://${{ secrets.DOMAIN }} || echo "")
+
+          if [[ -z "$TIME" ]]; then
+            echo "新 IP 访问失败，执行回滚到旧 IP: $OLD_IP"
+
+            curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"A\",\"name\":\"${{ secrets.DOMAIN }}\",\"content\":\"$OLD_IP\",\"ttl\":120,\"proxied\":${PROXIED}}"
+
+            echo "已回滚到旧 IP: $OLD_IP"
+            exit 1
+          else
+            echo "新 IP 验证通过，time_connect: $TIME 秒"
+          fi
+
+      - name: Save log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-probe-logs
+          path: ${{ env.LOG_FILE }}
